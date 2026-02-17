@@ -101,27 +101,6 @@ async def on_voice_state_update(member, before, after):
         if vc_role_id:
             await bot.get_channel(after.channel.id).send(f"<@&{vc_role_id}> {username} has joined {after.channel.name}!", delete_after=300)
 
-TARGET_EMOJIS = {"6️⃣", "7️⃣"}
-
-# 6 7 is not allowed
-@bot.event
-async def on_reaction_add(reaction, user):
-    if user.bot:
-        return
-
-    message = await reaction.message.channel.fetch_message(reaction.message.id)
-
-    # get all emoji reactions on the message
-    present = {str(r.emoji) for r in message.reactions}
-
-    # check if both 6 and 7 are present
-    if TARGET_EMOJIS.issubset(present):
-        for emoji in TARGET_EMOJIS:
-            await message.clear_reaction(emoji)
-
-        print(f"6 7 reactions by {user.name} removed.")
-
-
 # Run the bot
 if __name__ == "__main__":
     bot.run(os.getenv('DISCORD_TOKEN'))

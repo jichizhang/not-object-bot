@@ -40,7 +40,8 @@ class UwuLockCog(commands.Cog):
         if not message.content:
             return
 
-        uwuified = uwuify.uwu(message.content)
+        flags = uwuify.SMILEY | uwuify.YU | uwuify.STUTTER
+        uwuified = uwuify.uwu(message.content, flags=flags)
 
         try:
             # Get the base channel for webhook creation (threads share parent channel's webhooks)

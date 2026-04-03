@@ -1,7 +1,10 @@
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
 import uwuify
+
+_URL_RE = re.compile(r'(https?://\S+)')
 
 
 class UwuLockCog(commands.Cog):
@@ -39,9 +42,16 @@ class UwuLockCog(commands.Cog):
         # Need message content to uwuify
         if not message.content:
             return
+        # Do not uwuify messages with attachments, as attachments will be deleted when message gets deleted
+        if message.attachments:
+            return
 
         flags = uwuify.SMILEY | uwuify.YU | uwuify.STUTTER
-        uwuified = uwuify.uwu(message.content, flags=flags)
+        parts = _URL_RE.split(message.content)
+        uwuified = ''.join(
+            part if _URL_RE.fullmatch(part) else uwuify.uwu(part, flags=flags)
+            for part in parts
+        )
 
         try:
             # Get the base channel for webhook creation (threads share parent channel's webhooks)

@@ -400,6 +400,15 @@ def mark_song_as_used(song_id):
     conn.close()
 
 
+def remove_pending_songs(user_id):
+    """Remove all unused (pending) songs for a user"""
+    conn = sqlite3.connect('not_object.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM sotd_songs WHERE user_id = ? AND used = 0', (user_id,))
+    conn.commit()
+    conn.close()
+
+
 def can_add_song(track_name, artist_name):
     """Check if a song can be added to the database.
     Returns True if:

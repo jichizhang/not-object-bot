@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 import os
 from dotenv import load_dotenv
-from utils.database import init_database, can_earn_daily_message_reward, process_daily_message_reward
+from utils.database import init_database, can_earn_daily_message_reward, process_daily_message_reward, remove_pending_songs
 
 # Load environment variables
 load_dotenv()
@@ -101,6 +101,10 @@ async def on_voice_state_update(member, before, after):
         vc_role_id = os.getenv('VC_ROLE_ID')
         if vc_role_id:
             await bot.get_channel(after.channel.id).send(f"<@&{vc_role_id}> {username} has joined {after.channel.name}!")
+
+@bot.event
+async def on_member_remove(member):
+    remove_pending_songs(member.id)
 
 # Run the bot
 if __name__ == "__main__":

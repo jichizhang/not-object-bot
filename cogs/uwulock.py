@@ -64,7 +64,7 @@ class UwuLockCog(commands.Cog):
             webhooks = await webhook_channel.webhooks()
             webhook = next((w for w in webhooks if w.user == self.bot.user), None)
             if webhook is None:
-                webhook = await webhook_channel.create_webhook(name="UwuLock")
+                webhook = await webhook_channel.create_webhook(name="NotObject")
 
             await message.delete()
 

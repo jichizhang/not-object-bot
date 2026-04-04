@@ -29,6 +29,7 @@ class NotObjectBot(commands.Bot):
         await self.load_extension('cogs.snap')
         await self.load_extension('cogs.birthday')
         await self.load_extension('cogs.uwulock')
+        await self.load_extension('cogs.msgmover')
         
         # Sync commands
         # await self.tree.sync()

@@ -80,7 +80,7 @@ class MsgMoverCog(commands.Cog):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
 
         webhook_channel = destination.parent if isinstance(destination, discord.Thread) else destination
 

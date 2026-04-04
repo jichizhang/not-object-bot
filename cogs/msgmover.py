@@ -29,13 +29,6 @@ class MsgMoverCog(commands.Cog):
         webhook: discord.Webhook,
     ) -> None:
         content = message.content or ""
-
-        if message.reference and isinstance(message.reference.resolved, discord.Message):
-            ref = message.reference.resolved
-            ref_content = ref.content[:100] + ("..." if len(ref.content) > 100 else "")
-            quote = f"> **{ref.author.display_name}**" + (f": {ref_content}" if ref_content else "") + "\n"
-            content = quote + content
-
         files = [await a.to_file() for a in message.attachments]
 
         send_kwargs: dict = dict(

@@ -100,7 +100,11 @@ class MsgMoverCog(commands.Cog):
                     color=discord.Color.blurple(),
                 ))
             else:
-                messages = [msg async for msg in interaction.channel.history(limit=count)]
+                original_response = await interaction.original_response()
+                messages = [
+                    msg async for msg in interaction.channel.history(limit=count + 1)
+                    if msg.id != original_response.id
+                ][:count]
                 messages.reverse()  # oldest first so they appear in order
                 n = len(messages)
                 noun = "message" if n == 1 else "messages"

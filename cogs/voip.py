@@ -78,6 +78,12 @@ class TwilioAudioSink(voice_recv.AudioSink):
 
     def write(self, user, data) -> None:
         if data.pcm:
+            # Evict stale frames to stay near the live edge (~100 ms cap)
+            while self._q.qsize() > 5:
+                try:
+                    self._q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             try:
                 self._q.put_nowait(data.pcm)
             except asyncio.QueueFull:
@@ -102,8 +108,8 @@ class VoipCog(commands.Cog):
         self.voice_client: voice_recv.VoiceRecvClient | None = None
         self.stream_ws: web.WebSocketResponse | None = None
         self.stream_sid: str | None = None
-        self.twilio_to_discord: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
-        self.discord_to_twilio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        self.twilio_to_discord: asyncio.Queue[bytes] = asyncio.Queue(maxsize=20)
+        self.discord_to_twilio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=20)
         self._bridge_task: asyncio.Task | None = None
         self._runner: web.AppRunner | None = None
 
@@ -167,6 +173,12 @@ class VoipCog(commands.Cog):
             elif event == 'media':
                 mulaw = base64.b64decode(data['media']['payload'])
                 pcm = await loop.run_in_executor(None, _mulaw_to_discord_pcm, mulaw)
+                # Evict stale frames to stay near the live edge (~100 ms cap)
+                while self.twilio_to_discord.qsize() > 5:
+                    try:
+                        self.twilio_to_discord.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
                 try:
                     self.twilio_to_discord.put_nowait(pcm)
                 except asyncio.QueueFull:

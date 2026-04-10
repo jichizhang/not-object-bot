@@ -31,7 +31,8 @@ class NotObjectBot(commands.Bot):
         await self.load_extension('cogs.uwulock')
         await self.load_extension('cogs.msgmover')
         await self.load_extension('cogs.homeassistant')
-        
+        await self.load_extension('cogs.voip')
+
         # Sync commands
         # await self.tree.sync()
 

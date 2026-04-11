@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import wave
 
 import discord
 from discord import app_commands
@@ -172,7 +173,7 @@ class VoipCog(commands.Cog):
         self._ringtone_pcm: bytes = b''
 
     async def cog_load(self) -> None:
-        self._ringtone_pcm = self._generate_ringtone_pcm()
+        self._ringtone_pcm = self._load_ringtone_pcm()
         asyncio.create_task(self._start_web_server())
 
     async def cog_unload(self) -> None:
@@ -185,15 +186,55 @@ class VoipCog(commands.Cog):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _generate_ringtone_pcm() -> bytes:
-        """Generate a 440 Hz ringtone (0.4s on / 0.6s off) as 48 kHz stereo PCM."""
+    def _load_ringtone_pcm() -> bytes:
+        """Load assets/ringtone.wav and convert to 48 kHz stereo 16-bit PCM.
+
+        Falls back to a generated 440 Hz tone if the file is not found.
+        Handles any sample rate or channel count in the source WAV.
+        """
+        wav_path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'ringtone.wav')
+        wav_path = os.path.normpath(wav_path)
+        if os.path.isfile(wav_path):
+            with wave.open(wav_path, 'rb') as wf:
+                src_rate = wf.getframerate()
+                src_channels = wf.getnchannels()
+                src_width = wf.getsampwidth()
+                raw = wf.readframes(wf.getnframes())
+
+            # Normalise to int16
+            if src_width == 1:
+                audio = (np.frombuffer(raw, dtype=np.uint8).astype(np.int16) - 128) << 8
+            elif src_width == 2:
+                audio = np.frombuffer(raw, dtype=np.int16).copy()
+            elif src_width == 4:
+                audio = (np.frombuffer(raw, dtype=np.int32) >> 16).astype(np.int16)
+            else:
+                audio = np.frombuffer(raw, dtype=np.int16).copy()
+
+            # Reshape to (frames, channels)
+            audio = audio.reshape(-1, src_channels)
+
+            # Mix down to mono if needed
+            if src_channels > 1:
+                audio = audio.mean(axis=1).astype(np.int16)
+            else:
+                audio = audio[:, 0]
+
+            # Resample to 48 kHz if needed
+            if src_rate != 48000:
+                audio = soxr.resample(audio.astype(np.float32), src_rate, 48000).astype(np.int16)
+
+            # Duplicate mono channel to stereo
+            stereo = np.repeat(audio, 2)
+            return stereo.tobytes()
+
+        # Fallback: generated 440 Hz beep (0.4s on / 0.6s off)
         sample_rate = 48000
         on_samples = int(sample_rate * 0.4)
         off_samples = int(sample_rate * 0.6)
         t = np.linspace(0, 0.4, on_samples, endpoint=False)
         tone = (np.sin(2 * np.pi * 440.0 * t) * 32767 * 0.5).astype(np.int16)
         silence = np.zeros(off_samples, dtype=np.int16)
-        # 192000 bytes total = 50 × FRAME_SIZE(3840), so no seam artifacts on loop
         cycle_stereo = np.repeat(np.concatenate([tone, silence]), 2)
         return cycle_stereo.tobytes()
 

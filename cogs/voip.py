@@ -95,9 +95,10 @@ class LoopingPCMAudioSource(discord.AudioSource):
 class TwilioAudioSink(voice_recv.AudioSink):
     """Captures Discord VC audio, mixes all speakers, and enqueues for Twilio."""
 
-    def __init__(self, queue: asyncio.Queue):
+    def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
         super().__init__()
         self._q = queue
+        self._loop = loop
         self._mix_buf: np.ndarray | None = None  # accumulator for current frame
 
     def wants_opus(self) -> bool:
@@ -120,13 +121,18 @@ class TwilioAudioSink(voice_recv.AudioSink):
         mixed = np.clip(self._mix_buf, -32768, 32767).astype(np.int16)
         self._mix_buf = None
 
+        # Thread-safe: schedule on the event loop so asyncio.Queue is touched only
+        # from the loop thread (prevents lost wakeup when a waiter is registered).
+        self._loop.call_soon_threadsafe(self._enqueue, mixed.tobytes())
+
+    def _enqueue(self, data: bytes) -> None:
         while self._q.qsize() > 5:
             try:
                 self._q.get_nowait()
             except asyncio.QueueEmpty:
                 break
         try:
-            self._q.put_nowait(mixed.tobytes())
+            self._q.put_nowait(data)
         except asyncio.QueueFull:
             pass
 
@@ -456,7 +462,7 @@ class VoipCog(commands.Cog):
 
         if self.voice_client:
             self.voice_client.play(QueueAudioSource(self.twilio_to_discord))
-            self.voice_client.listen(TwilioAudioSink(self.discord_to_twilio))
+            self.voice_client.listen(TwilioAudioSink(self.discord_to_twilio, asyncio.get_running_loop()))
 
         self._bridge_task = asyncio.create_task(self._forward_discord_to_twilio())
 
@@ -602,7 +608,7 @@ class VoipCog(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
-        sink = TwilioAudioSink(self.discord_to_twilio)
+        sink = TwilioAudioSink(self.discord_to_twilio, asyncio.get_running_loop())
         self.voice_client.listen(sink)
 
         base_url = os.getenv('WEBHOOK_BASE_URL', '')

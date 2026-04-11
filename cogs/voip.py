@@ -93,31 +93,46 @@ class LoopingPCMAudioSource(discord.AudioSource):
 
 
 class TwilioAudioSink(voice_recv.AudioSink):
-    """Captures Discord VC audio and enqueues it for forwarding to Twilio."""
+    """Captures Discord VC audio, mixes all speakers, and enqueues for Twilio."""
 
     def __init__(self, queue: asyncio.Queue):
         super().__init__()
         self._q = queue
+        self._mix_buf: np.ndarray | None = None  # accumulator for current frame
 
     def wants_opus(self) -> bool:
         return False
 
     def write(self, user, data) -> None:
-        if data.pcm:
-            # Evict stale frames to stay near the live edge (~100 ms cap)
-            while self._q.qsize() > 5:
-                try:
-                    self._q.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+        if not data.pcm:
+            return
+        incoming = np.frombuffer(data.pcm, dtype=np.int16).astype(np.int32)
+        if self._mix_buf is None:
+            self._mix_buf = incoming
+        else:
+            # Pad/trim so lengths match, then sum
+            length = max(len(self._mix_buf), len(incoming))
+            a = np.pad(self._mix_buf, (0, length - len(self._mix_buf)))
+            b = np.pad(incoming,       (0, length - len(incoming)))
+            self._mix_buf = a + b
+
+        # Flush: clip to int16 range and enqueue the mixed frame
+        mixed = np.clip(self._mix_buf, -32768, 32767).astype(np.int16)
+        self._mix_buf = None
+
+        while self._q.qsize() > 5:
             try:
-                self._q.put_nowait(data.pcm)
-            except asyncio.QueueFull:
-                pass  # drop frame rather than block the audio thread
+                self._q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        try:
+            self._q.put_nowait(mixed.tobytes())
+        except asyncio.QueueFull:
+            pass
 
     def cleanup(self) -> None:
-        pass
-
+        self._mix_buf = None
+        
 
 class IncomingCallView(discord.ui.View):
     """Buttons for accepting or declining an inbound call."""

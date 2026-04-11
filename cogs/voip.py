@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 import re
 
 import discord
@@ -66,6 +67,30 @@ class QueueAudioSource(discord.AudioSource):
         return bytes(self.FRAME_SIZE)  # silence if queue is dry
 
 
+class LoopingPCMAudioSource(discord.AudioSource):
+    """Loops a pre-computed PCM buffer indefinitely, serving 20ms frames. Used for ringtone playback."""
+
+    FRAME_SIZE = 3840  # 20 ms at 48 kHz stereo 16-bit
+
+    def __init__(self, pcm_data: bytes):
+        self._data = pcm_data
+        self._pos = 0
+
+    def is_opus(self) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        needed = self.FRAME_SIZE
+        result = bytearray()
+        while len(result) < needed:
+            chunk = self._data[self._pos:self._pos + (needed - len(result))]
+            result.extend(chunk)
+            self._pos += len(chunk)
+            if self._pos >= len(self._data):
+                self._pos = 0
+        return bytes(result)
+
+
 class TwilioAudioSink(voice_recv.AudioSink):
     """Captures Discord VC audio and enqueues it for forwarding to Twilio."""
 
@@ -93,6 +118,29 @@ class TwilioAudioSink(voice_recv.AudioSink):
         pass
 
 
+class IncomingCallView(discord.ui.View):
+    """Buttons for accepting or declining an inbound call."""
+
+    def __init__(self, accepted: asyncio.Event, declined: asyncio.Event):
+        super().__init__(timeout=None)  # timeout managed externally by _ring_task
+        self._accepted = accepted
+        self._declined = declined
+
+    @discord.ui.button(label='Pick Up', style=discord.ButtonStyle.success, emoji='📞')
+    async def pick_up(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(view=self)
+        self._accepted.set()
+
+    @discord.ui.button(label='Hang Up', style=discord.ButtonStyle.danger, emoji='📵')
+    async def hang_up(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(view=self)
+        self._declined.set()
+
+
 class VoipCog(commands.Cog):
     """Bridge a phone call into a Discord voice channel using Twilio Media Streams."""
 
@@ -113,13 +161,41 @@ class VoipCog(commands.Cog):
         self._bridge_task: asyncio.Task | None = None
         self._runner: web.AppRunner | None = None
 
+        # Inbound call state
+        self._is_inbound: bool = False
+        self._caller_number: str | None = None
+        self._ring_task: asyncio.Task | None = None
+        self._ring_accepted: asyncio.Event = asyncio.Event()
+        self._ring_declined: asyncio.Event = asyncio.Event()
+        self._ring_message: discord.Message | None = None
+        self._ring_channel: discord.TextChannel | None = None
+        self._ringtone_pcm: bytes = b''
+
     async def cog_load(self) -> None:
+        self._ringtone_pcm = self._generate_ringtone_pcm()
         asyncio.create_task(self._start_web_server())
 
     async def cog_unload(self) -> None:
         await self._cleanup(cancel_call=False)
         if self._runner:
             await self._runner.cleanup()
+
+    # ------------------------------------------------------------------
+    # Audio helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _generate_ringtone_pcm() -> bytes:
+        """Generate a 440 Hz ringtone (0.4s on / 0.6s off) as 48 kHz stereo PCM."""
+        sample_rate = 48000
+        on_samples = int(sample_rate * 0.4)
+        off_samples = int(sample_rate * 0.6)
+        t = np.linspace(0, 0.4, on_samples, endpoint=False)
+        tone = (np.sin(2 * np.pi * 440.0 * t) * 32767 * 0.5).astype(np.int16)
+        silence = np.zeros(off_samples, dtype=np.int16)
+        # 192000 bytes total = 50 × FRAME_SIZE(3840), so no seam artifacts on loop
+        cycle_stereo = np.repeat(np.concatenate([tone, silence]), 2)
+        return cycle_stereo.tobytes()
 
     # ------------------------------------------------------------------
     # Embedded aiohttp server
@@ -135,8 +211,33 @@ class VoipCog(commands.Cog):
         await site.start()
 
     async def _twiml_handler(self, request: web.Request) -> web.Response:
-        """Return TwiML that opens a bidirectional Media Stream WebSocket."""
+        """Return TwiML based on call direction. Handles inbound rejection paths."""
         base_url = os.getenv('WEBHOOK_BASE_URL', '')
+        post_data = await request.post()
+        direction = post_data.get('Direction', '')
+        caller = post_data.get('From', '')
+        call_sid = post_data.get('CallSid', '')
+
+        # Reject if already in a call
+        if self.active_call_sid:
+            xml = '<?xml version="1.0" encoding="UTF-8"?>\n<Response><Reject reason="busy"/></Response>'
+            return web.Response(text=xml, content_type='text/xml')
+
+        if direction == 'inbound':
+            target_vc = self._find_best_voice_channel()
+            if target_vc is None:
+                xml = (
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<Response>'
+                    '<Say voice="alice">You have reached Object land. No one is available right now. Please try again later.</Say>'
+                    '<Hangup/>'
+                    '</Response>'
+                )
+                return web.Response(text=xml, content_type='text/xml')
+            self._is_inbound = True
+            self._caller_number = caller
+            self.active_call_sid = call_sid
+
         xml = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<Response>\n'
@@ -163,14 +264,19 @@ class VoipCog(commands.Cog):
 
             if event == 'start':
                 self.stream_sid = data.get('streamSid')
-                # Start playing phone audio into Discord VC
-                if self.voice_client and not self.voice_client.is_playing():
-                    source = QueueAudioSource(self.twilio_to_discord)
-                    self.voice_client.play(source)
-                # Start forwarding Discord audio back to Twilio
-                self._bridge_task = asyncio.create_task(self._forward_discord_to_twilio())
+                if self._is_inbound:
+                    self._ring_task = asyncio.create_task(self._handle_inbound_ring())
+                else:
+                    # Outbound: voice_client already connected, start bridge immediately
+                    if self.voice_client and not self.voice_client.is_playing():
+                        source = QueueAudioSource(self.twilio_to_discord)
+                        self.voice_client.play(source)
+                    self._bridge_task = asyncio.create_task(self._forward_discord_to_twilio())
 
             elif event == 'media':
+                # Discard caller audio during inbound ringing phase (before bridge starts)
+                if self._is_inbound and self._bridge_task is None:
+                    continue
                 mulaw = base64.b64decode(data['media']['payload'])
                 pcm = await loop.run_in_executor(None, _mulaw_to_discord_pcm, mulaw)
                 # Evict stale frames to stay near the live edge (~100 ms cap)
@@ -215,6 +321,140 @@ class VoipCog(commands.Cog):
                 break
 
     # ------------------------------------------------------------------
+    # Inbound call helpers
+    # ------------------------------------------------------------------
+
+    def _find_best_voice_channel(self) -> discord.VoiceChannel | None:
+        """Return the voice channel with the most non-bot members, random tiebreak."""
+        if not self.bot.guilds:
+            return None
+        guild = self.bot.guilds[0]
+        best: list[discord.VoiceChannel] = []
+        best_count = 0
+        for vc in guild.voice_channels:
+            count = sum(1 for m in vc.members if not m.bot)
+            if count > best_count:
+                best_count = count
+                best = [vc]
+            elif count == best_count and count > 0:
+                best.append(vc)
+        return random.choice(best) if best else None
+
+    def _get_notification_channel(self, voice_channel: discord.VoiceChannel) -> discord.TextChannel | None:
+        """Return a text channel to send call notifications to, preferring the VC's category."""
+        guild = voice_channel.guild
+
+        def can_send(ch: discord.TextChannel) -> bool:
+            perms = ch.permissions_for(guild.me)
+            return perms.send_messages and perms.embed_links
+
+        if voice_channel.category:
+            for ch in voice_channel.category.text_channels:
+                if can_send(ch):
+                    return ch
+
+        if guild.system_channel and can_send(guild.system_channel):
+            return guild.system_channel
+
+        for ch in guild.text_channels:
+            if can_send(ch):
+                return ch
+        return None
+
+    async def _handle_inbound_ring(self) -> None:
+        """Join a VC, play a ringtone, and wait for a Discord user to accept or decline."""
+        target_vc = self._find_best_voice_channel()
+        if target_vc is None:
+            # Race condition: everyone left between POST and WebSocket start
+            await self._cleanup(cancel_call=True)
+            return
+
+        try:
+            self.voice_client = await target_vc.connect(cls=voice_recv.VoiceRecvClient)
+        except Exception:
+            await self._cleanup(cancel_call=True)
+            return
+
+        self.voice_client.play(LoopingPCMAudioSource(self._ringtone_pcm))
+
+        self._ring_accepted.clear()
+        self._ring_declined.clear()
+        view = IncomingCallView(self._ring_accepted, self._ring_declined)
+        self._ring_channel = self._get_notification_channel(target_vc)
+
+        caller_display = self._caller_number or 'Unknown'
+        embed = discord.Embed(
+            title='Incoming Call',
+            description=f'📞 Incoming call from **{caller_display}**',
+            color=0x57f287,
+        )
+        embed.set_footer(text='You have 30 seconds to answer.')
+
+        if self._ring_channel:
+            try:
+                self._ring_message = await self._ring_channel.send(embed=embed, view=view)
+            except Exception:
+                self._ring_message = None
+
+        # Wait up to 30s for Pick Up or Hang Up
+        t_accepted = asyncio.create_task(self._ring_accepted.wait())
+        t_declined = asyncio.create_task(self._ring_declined.wait())
+        done, pending = await asyncio.wait(
+            [t_accepted, t_declined],
+            timeout=30.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+
+        accepted = self._ring_accepted.is_set() and t_accepted in done
+
+        if accepted:
+            await self._start_inbound_bridge()
+        else:
+            await self._reject_inbound_call()
+
+    async def _start_inbound_bridge(self) -> None:
+        """Transition from ringtone to full bidirectional audio bridge."""
+        if self.voice_client and self.voice_client.is_playing():
+            self.voice_client.stop()
+
+        if self.voice_client:
+            self.voice_client.play(QueueAudioSource(self.twilio_to_discord))
+            self.voice_client.listen(TwilioAudioSink(self.discord_to_twilio))
+
+        self._bridge_task = asyncio.create_task(self._forward_discord_to_twilio())
+
+        if self._ring_message:
+            caller_display = self._caller_number or 'Unknown'
+            embed = discord.Embed(
+                title='Call Connected',
+                description=f'📞 In call with **{caller_display}**',
+                color=0x4ecdc4,
+            )
+            embed.set_footer(text='Use /hangup to end the call.')
+            try:
+                await self._ring_message.edit(embed=embed, view=None)
+            except Exception:
+                pass
+        self._ring_message = None
+
+    async def _reject_inbound_call(self) -> None:
+        """Update the notification embed and clean up after a declined or timed-out call."""
+        if self._ring_message:
+            embed = discord.Embed(
+                title='Missed Call',
+                description=f'📵 Missed call from **{self._caller_number or "Unknown"}**',
+                color=0xff6b6b,
+            )
+            try:
+                await self._ring_message.edit(embed=embed, view=None)
+            except Exception:
+                pass
+        self._ring_message = None
+        await self._cleanup(cancel_call=True)
+
+    # ------------------------------------------------------------------
     # Shared teardown
     # ------------------------------------------------------------------
 
@@ -253,6 +493,31 @@ class VoipCog(commands.Cog):
             self.discord_to_twilio.get_nowait()
 
         self.stream_sid = None
+
+        # Cancel ring task if still running
+        if self._ring_task and not self._ring_task.done():
+            self._ring_task.cancel()
+        self._ring_task = None
+
+        # Reset inbound state
+        self._is_inbound = False
+        self._caller_number = None
+        self._ring_accepted.clear()
+        self._ring_declined.clear()
+
+        # Best-effort update of any pending ring message
+        if self._ring_message:
+            embed = discord.Embed(
+                title='Call Ended',
+                description='The call was disconnected.',
+                color=0xff6b6b,
+            )
+            try:
+                asyncio.get_event_loop().create_task(self._ring_message.edit(embed=embed, view=None))
+            except Exception:
+                pass
+        self._ring_message = None
+        self._ring_channel = None
 
     # ------------------------------------------------------------------
     # Slash commands

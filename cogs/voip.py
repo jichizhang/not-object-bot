@@ -168,7 +168,7 @@ class VoipCog(commands.Cog):
         self._ring_accepted: asyncio.Event = asyncio.Event()
         self._ring_declined: asyncio.Event = asyncio.Event()
         self._ring_message: discord.Message | None = None
-        self._ring_channel: discord.TextChannel | None = None
+        self._ring_channel: discord.VoiceChannel | None = None
         self._ringtone_pcm: bytes = b''
 
     async def cog_load(self) -> None:
@@ -340,27 +340,6 @@ class VoipCog(commands.Cog):
                 best.append(vc)
         return random.choice(best) if best else None
 
-    def _get_notification_channel(self, voice_channel: discord.VoiceChannel) -> discord.TextChannel | None:
-        """Return a text channel to send call notifications to, preferring the VC's category."""
-        guild = voice_channel.guild
-
-        def can_send(ch: discord.TextChannel) -> bool:
-            perms = ch.permissions_for(guild.me)
-            return perms.send_messages and perms.embed_links
-
-        if voice_channel.category:
-            for ch in voice_channel.category.text_channels:
-                if can_send(ch):
-                    return ch
-
-        if guild.system_channel and can_send(guild.system_channel):
-            return guild.system_channel
-
-        for ch in guild.text_channels:
-            if can_send(ch):
-                return ch
-        return None
-
     async def _handle_inbound_ring(self) -> None:
         """Join a VC, play a ringtone, and wait for a Discord user to accept or decline."""
         target_vc = self._find_best_voice_channel()
@@ -380,7 +359,7 @@ class VoipCog(commands.Cog):
         self._ring_accepted.clear()
         self._ring_declined.clear()
         view = IncomingCallView(self._ring_accepted, self._ring_declined)
-        self._ring_channel = self._get_notification_channel(target_vc)
+        self._ring_channel = target_vc
 
         caller_display = self._caller_number or 'Unknown'
         embed = discord.Embed(

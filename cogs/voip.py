@@ -280,8 +280,8 @@ class VoipCog(commands.Cog):
         caller = post_data.get('From', '')
         call_sid = post_data.get('CallSid', '')
 
-        # Reject if already in a call
-        if self.active_call_sid:
+        # Reject a *new* call if one is already active; allow the active call's own webhook through
+        if self.active_call_sid and call_sid != self.active_call_sid:
             xml = '<?xml version="1.0" encoding="UTF-8"?>\n<Response><Reject reason="busy"/></Response>'
             return web.Response(text=xml, content_type='text/xml')
 

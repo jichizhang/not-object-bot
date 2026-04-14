@@ -291,7 +291,7 @@ class VoipCog(commands.Cog):
                 xml = (
                     '<?xml version="1.0" encoding="UTF-8"?>\n'
                     '<Response>'
-                    '<Say voice="alice">You have reached Object land. No one is available right now. Please try again later.</Say>'
+                    '<Say>You have reached Object land. No one is available right now. Please try again later.</Say>'
                     '<Hangup/>'
                     '</Response>'
                 )

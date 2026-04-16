@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import threading
 import wave
 
 import discord
@@ -22,25 +23,6 @@ except ImportError:
 
 
 E164_RE = re.compile(r'^\+[1-9]\d{1,14}$')
-
-
-def _mulaw_to_discord_pcm(mulaw_bytes: bytes) -> bytes:
-    """Convert µ-law 8 kHz mono to PCM 16-bit 48 kHz stereo."""
-    pcm_8k = audioop.ulaw2lin(mulaw_bytes, 2)
-    audio = np.frombuffer(pcm_8k, dtype=np.int16)
-    audio_48k = soxr.resample(audio.astype(np.float32), 8000, 48000).astype(np.int16)
-    stereo = np.repeat(audio_48k, 2)  # mono → stereo (duplicate channel)
-    return stereo.tobytes()
-
-
-def _discord_pcm_to_mulaw(pcm_bytes: bytes) -> bytes:
-    """Convert PCM 16-bit 48 kHz stereo to µ-law 8 kHz mono."""
-    audio = np.frombuffer(pcm_bytes, dtype=np.int16)
-    if len(audio) < 2:
-        return b''
-    mono = ((audio[::2].astype(np.int32) + audio[1::2].astype(np.int32)) // 2).astype(np.int16)
-    audio_8k = soxr.resample(mono.astype(np.float32), 48000, 8000).astype(np.int16)
-    return audioop.lin2ulaw(audio_8k.tobytes(), 2)
 
 
 class QueueAudioSource(discord.AudioSource):
@@ -93,37 +75,58 @@ class LoopingPCMAudioSource(discord.AudioSource):
 
 
 class TwilioAudioSink(voice_recv.AudioSink):
-    """Captures Discord VC audio, mixes all speakers, and enqueues for Twilio."""
+    """Captures Discord VC audio, mixes all speakers within a 20 ms window,
+    and enqueues one mixed frame per window for Twilio.
+
+    write() is called by voice-recv once per user per frame, on a non-loop thread.
+    We accumulate into _mix_buf under a lock, and a 20 ms loop-thread timer flushes
+    the accumulator as a single frame. This keeps the outbound packet rate at ~50 pps
+    regardless of how many Discord users are speaking simultaneously.
+    """
+
+    FRAME_INTERVAL = 0.02  # 20 ms
 
     def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
         super().__init__()
         self._q = queue
         self._loop = loop
-        self._mix_buf: np.ndarray | None = None  # accumulator for current frame
+        self._mix_buf: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._flush_handle: asyncio.Handle | None = None
+        self._stopped = False
+        # Kick off the periodic flush on the loop thread.
+        loop.call_soon_threadsafe(self._schedule_flush)
 
     def wants_opus(self) -> bool:
         return False
+
+    def _schedule_flush(self) -> None:
+        if self._stopped:
+            return
+        self._flush_handle = self._loop.call_later(self.FRAME_INTERVAL, self._flush)
+
+    def _flush(self) -> None:
+        with self._lock:
+            buf, self._mix_buf = self._mix_buf, None
+        if buf is not None:
+            mixed = np.clip(buf, -32768, 32767).astype(np.int16)
+            self._enqueue(mixed.tobytes())
+        self._schedule_flush()
 
     def write(self, user, data) -> None:
         if not data.pcm:
             return
         incoming = np.frombuffer(data.pcm, dtype=np.int16).astype(np.int32)
-        if self._mix_buf is None:
-            self._mix_buf = incoming
-        else:
-            # Pad/trim so lengths match, then sum
-            length = max(len(self._mix_buf), len(incoming))
-            a = np.pad(self._mix_buf, (0, length - len(self._mix_buf)))
-            b = np.pad(incoming,       (0, length - len(incoming)))
-            self._mix_buf = a + b
-
-        # Flush: clip to int16 range and enqueue the mixed frame
-        mixed = np.clip(self._mix_buf, -32768, 32767).astype(np.int16)
-        self._mix_buf = None
-
-        # Thread-safe: schedule on the event loop so asyncio.Queue is touched only
-        # from the loop thread (prevents lost wakeup when a waiter is registered).
-        self._loop.call_soon_threadsafe(self._enqueue, mixed.tobytes())
+        with self._lock:
+            if self._mix_buf is None:
+                self._mix_buf = incoming.copy()
+            else:
+                a, b = self._mix_buf, incoming
+                if len(a) != len(b):
+                    length = max(len(a), len(b))
+                    a = np.pad(a, (0, length - len(a)))
+                    b = np.pad(b, (0, length - len(b)))
+                self._mix_buf = a + b
 
     def _enqueue(self, data: bytes) -> None:
         while self._q.qsize() > 5:
@@ -137,8 +140,12 @@ class TwilioAudioSink(voice_recv.AudioSink):
             pass
 
     def cleanup(self) -> None:
+        self._stopped = True
+        if self._flush_handle:
+            self._flush_handle.cancel()
+            self._flush_handle = None
         self._mix_buf = None
-        
+
 
 class IncomingCallView(discord.ui.View):
     """Buttons for accepting or declining an inbound call."""
@@ -183,6 +190,12 @@ class VoipCog(commands.Cog):
         self._bridge_task: asyncio.Task | None = None
         self._runner: web.AppRunner | None = None
 
+        # Streaming resamplers (created per call, destroyed on cleanup).
+        # Holding filter state across chunks avoids the ~50 Hz boundary-artifact
+        # buzz that chunk-by-chunk soxr.resample() would produce.
+        self._up_resampler: soxr.ResampleStream | None = None     # phone → Discord (8k → 48k)
+        self._down_resampler: soxr.ResampleStream | None = None   # Discord → phone (48k → 8k)
+
         # Inbound call state
         self._is_inbound: bool = False
         self._caller_number: str | None = None
@@ -205,6 +218,31 @@ class VoipCog(commands.Cog):
     # ------------------------------------------------------------------
     # Audio helpers
     # ------------------------------------------------------------------
+
+    def _mulaw_to_discord_pcm(self, mulaw_bytes: bytes) -> bytes:
+        """Convert µ-law 8 kHz mono → PCM 16-bit 48 kHz stereo via streaming resampler."""
+        if self._up_resampler is None:
+            return b''
+        pcm_8k = audioop.ulaw2lin(mulaw_bytes, 2)
+        audio = np.frombuffer(pcm_8k, dtype=np.int16)
+        audio_48k = self._up_resampler.resample_chunk(audio)
+        if len(audio_48k) == 0:
+            return b''
+        stereo = np.repeat(audio_48k.astype(np.int16), 2)  # mono → stereo (duplicate channel)
+        return stereo.tobytes()
+
+    def _discord_pcm_to_mulaw(self, pcm_bytes: bytes) -> bytes:
+        """Convert PCM 16-bit 48 kHz stereo → µ-law 8 kHz mono via streaming resampler."""
+        if self._down_resampler is None:
+            return b''
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if len(audio) < 2:
+            return b''
+        mono = ((audio[::2].astype(np.int32) + audio[1::2].astype(np.int32)) // 2).astype(np.int16)
+        audio_8k = self._down_resampler.resample_chunk(mono)
+        if len(audio_8k) == 0:
+            return b''
+        return audioop.lin2ulaw(audio_8k.astype(np.int16).tobytes(), 2)
 
     @staticmethod
     def _load_ringtone_pcm() -> bytes:
@@ -241,7 +279,8 @@ class VoipCog(commands.Cog):
             else:
                 audio = audio[:, 0]
 
-            # Resample to 48 kHz if needed
+            # Resample to 48 kHz if needed (one-shot is fine here — it's a finite buffer
+            # loaded once at startup, not a streaming signal)
             if src_rate != 48000:
                 audio = soxr.resample(audio.astype(np.float32), src_rate, 48000).astype(np.int16)
 
@@ -326,6 +365,10 @@ class VoipCog(commands.Cog):
 
             if event == 'start':
                 self.stream_sid = data.get('streamSid')
+                # Fresh streaming resamplers for this call — filter state must
+                # persist across chunks to avoid boundary artifacts.
+                self._up_resampler = soxr.ResampleStream(8000, 48000, 1, dtype='int16')
+                self._down_resampler = soxr.ResampleStream(48000, 8000, 1, dtype='int16')
                 if self._is_inbound:
                     self._ring_task = asyncio.create_task(self._handle_inbound_ring())
                 else:
@@ -340,7 +383,9 @@ class VoipCog(commands.Cog):
                 if self._is_inbound and self._bridge_task is None:
                     continue
                 mulaw = base64.b64decode(data['media']['payload'])
-                pcm = await loop.run_in_executor(None, _mulaw_to_discord_pcm, mulaw)
+                pcm = await loop.run_in_executor(None, self._mulaw_to_discord_pcm, mulaw)
+                if not pcm:
+                    continue
                 # Evict stale frames to stay near the live edge (~100 ms cap)
                 while self.twilio_to_discord.qsize() > 5:
                     try:
@@ -369,7 +414,7 @@ class VoipCog(commands.Cog):
                 continue
             except asyncio.CancelledError:
                 break
-            mulaw = await loop.run_in_executor(None, _discord_pcm_to_mulaw, pcm)
+            mulaw = await loop.run_in_executor(None, self._discord_pcm_to_mulaw, pcm)
             if not mulaw:
                 continue
             payload = {
@@ -532,6 +577,10 @@ class VoipCog(commands.Cog):
             self.twilio_to_discord.get_nowait()
         while not self.discord_to_twilio.empty():
             self.discord_to_twilio.get_nowait()
+
+        # Drop resamplers so the next call starts with fresh filter state
+        self._up_resampler = None
+        self._down_resampler = None
 
         self.stream_sid = None
 

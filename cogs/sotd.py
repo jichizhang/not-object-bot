@@ -9,7 +9,8 @@ from utils.database import (
     add_sotd_song,
     get_random_unused_song,
     mark_song_as_used,
-    can_add_song
+    can_add_song,
+    get_queue_counts,
 )
 
 SQUIGLY_API_BASE = "https://squigly.link/api"
@@ -131,6 +132,29 @@ class SotdCog(commands.Cog):
             embed.set_thumbnail(url=track_info["artwork_url"])
         embed.set_footer(text="Powered by Squigly")
         await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="queue", description="Show the number of songs in the SOTD queue per user")
+    async def show_queue(self, interaction: discord.Interaction):
+        counts = get_queue_counts()
+
+        if not counts:
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
+            return
+
+        total = sum(count for _, count in counts)
+        lines = []
+        for user_id, count in counts:
+            user = self.bot.get_user(user_id)
+            name = user.display_name if user else f"<@{user_id}>"
+            lines.append(f"{name} — {count}")
+
+        embed = discord.Embed(
+            title="SOTD Queue",
+            description="\n".join(lines),
+            color=0x1DB954,
+        )
+        embed.set_footer(text=f"{total} song{'s' if total != 1 else ''} total")
+        await interaction.response.send_message(embed=embed)
 
     @tasks.loop(hours=24)
     async def daily_sotd_task(self):

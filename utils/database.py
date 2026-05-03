@@ -411,6 +411,22 @@ def mark_song_as_used(song_id):
     conn.close()
 
 
+def get_queue_counts():
+    """Return list of (user_id, count) for all users with pending songs, ordered by count desc."""
+    conn = sqlite3.connect('not_object.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT user_id, COUNT(*) as count
+        FROM sotd_songs
+        WHERE used = 0
+        GROUP BY user_id
+        ORDER BY count DESC
+    ''')
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
 def remove_pending_songs(user_id):
     """Remove all unused (pending) songs for a user"""
     conn = sqlite3.connect('not_object.db')

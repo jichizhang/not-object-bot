@@ -42,8 +42,11 @@ def init_database():
             user_id INTEGER NOT NULL,
             track_name TEXT NOT NULL,
             artist_name TEXT NOT NULL,
-            album_cover_url TEXT NOT NULL,
-            spotify_url TEXT NOT NULL,
+            album_cover_url TEXT,
+            spotify_url TEXT,
+            apple_music_url TEXT,
+            tidal_url TEXT,
+            deezer_url TEXT,
             used INTEGER DEFAULT 0,
             date_added TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users (user_id)
@@ -78,7 +81,7 @@ def init_database():
     
     # Update existing users to have lifetime_coins equal to their current coins
     cursor.execute('UPDATE users SET lifetime_coins = coins WHERE lifetime_coins = 0 OR lifetime_coins IS NULL')
-    
+
     conn.commit()
     conn.close()
 
@@ -324,19 +327,23 @@ def refund_coins(user_id, username, amount):
     conn.close()
 
 
-def add_sotd_song(user_id, track_name, artist_name, album_cover_url, spotify_url):
+def add_sotd_song(user_id, track_name, artist_name, album_cover_url, spotify_url,
+                  apple_music_url=None, tidal_url=None, deezer_url=None):
     """Add a song to the SOTD database"""
     from datetime import datetime, timezone
-    
+
     conn = sqlite3.connect('not_object.db')
     cursor = conn.cursor()
-    
+
     today_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     cursor.execute('''
-        INSERT INTO sotd_songs (user_id, track_name, artist_name, album_cover_url, spotify_url, date_added)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (user_id, track_name, artist_name, album_cover_url, spotify_url, today_utc))
-    
+        INSERT INTO sotd_songs
+            (user_id, track_name, artist_name, album_cover_url, spotify_url,
+             apple_music_url, tidal_url, deezer_url, date_added)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, track_name, artist_name, album_cover_url, spotify_url,
+          apple_music_url, tidal_url, deezer_url, today_utc))
+
     conn.commit()
     conn.close()
 
@@ -364,7 +371,8 @@ def get_random_unused_song():
     
     # Then, get a random unused song from that user
     cursor.execute('''
-        SELECT id, user_id, track_name, artist_name, album_cover_url, spotify_url
+        SELECT id, user_id, track_name, artist_name, album_cover_url, spotify_url,
+               apple_music_url, tidal_url, deezer_url
         FROM sotd_songs
         WHERE used = 0 AND user_id = ?
         ORDER BY RANDOM()
@@ -380,7 +388,10 @@ def get_random_unused_song():
             'track_name': result[2],
             'artist_name': result[3],
             'album_cover_url': result[4],
-            'spotify_url': result[5]
+            'spotify_url': result[5],
+            'apple_music_url': result[6],
+            'tidal_url': result[7],
+            'deezer_url': result[8],
         }
     return None
 
